@@ -142,104 +142,129 @@ export const reserveInventory = async (req, res) => {
     try {
         const { salesOrderId } = req.params;
 
-        // Find sales order
-        const salesOrder = await prisma.salesOrder.findUnique({
-            where: {
-                id: salesOrderId,
-            },
-            include: {
-                items: true,
-            },
-        });
+        const updatedInventory = await prisma.$transaction(async (tx) => {
+            // Lock the sales order row so two requests cannot reserve
+            // the same sales order simultaneously.
+            const salesOrders = await tx.$queryRaw`
+                SELECT *
+                FROM "SalesOrder"
+                WHERE "id" = ${salesOrderId}
+                FOR UPDATE
+            `;
 
-        if (!salesOrder) {
-            return res.status(404).json({
-                success: false,
-                message: "Sales order not found",
-            });
-        }
+            if (salesOrders.length === 0) {
+                const error = new Error("Sales order not found");
+                error.statusCode = 404;
+                throw error;
+            }
 
-        // Only confirmed orders can reserve inventory
-        if (salesOrder.status !== "CONFIRMED") {
-            return res.status(400).json({
-                success: false,
-                message: "Only confirmed sales orders can reserve inventory",
-            });
-        }
+            const salesOrder = salesOrders[0];
 
-        // Prevent duplicate inventory reservation
-        if (salesOrder.inventoryReserved) {
-            return res.status(400).json({
-                success: false,
-                message: "Inventory has already been reserved for this sales order",
-            });
-        }
+            // Only confirmed orders can reserve inventory
+            if (salesOrder.status !== "CONFIRMED") {
+                const error = new Error(
+                    "Only confirmed sales orders can reserve inventory"
+                );
+                error.statusCode = 400;
+                throw error;
+            }
 
-        // Reserve each sales order item
-        for (const item of salesOrder.items) {
-            const inventory = await prisma.inventory.findUnique({
+            // Prevent duplicate reservation
+            if (salesOrder.inventoryReserved) {
+                const error = new Error(
+                    "Inventory has already been reserved for this sales order"
+                );
+                error.statusCode = 400;
+                throw error;
+            }
+
+            // Get sales order items
+            const items = await tx.salesOrderItem.findMany({
                 where: {
-                    productId: item.productId,
+                    salesOrderId,
                 },
             });
 
-            if (!inventory) {
-                return res.status(404).json({
-                    success: false,
-                    message: `Inventory not found for product ${item.productId}`,
+            if (items.length === 0) {
+                const error = new Error(
+                    "Sales order has no items"
+                );
+                error.statusCode = 400;
+                throw error;
+            }
+
+            // Lock and reserve every inventory row
+            for (const item of items) {
+                const inventoryRows = await tx.$queryRaw`
+                    SELECT *
+                    FROM "Inventory"
+                    WHERE "productId" = ${item.productId}
+                    FOR UPDATE
+                `;
+
+                if (inventoryRows.length === 0) {
+                    const error = new Error(
+                        `Inventory not found for product ${item.productId}`
+                    );
+                    error.statusCode = 404;
+                    throw error;
+                }
+
+                const inventory = inventoryRows[0];
+
+                const availableQuantity =
+                    inventory.physicalQuantity -
+                    inventory.reservedQuantity;
+
+                // Check available stock
+                if (availableQuantity < item.quantity) {
+                    const error = new Error(
+                        `Insufficient inventory for product ${item.productId}`
+                    );
+
+                    error.statusCode = 400;
+                    error.availableQuantity = availableQuantity;
+                    error.requiredQuantity = item.quantity;
+
+                    throw error;
+                }
+
+                // Reserve inventory
+                await tx.inventory.update({
+                    where: {
+                        productId: item.productId,
+                    },
+                    data: {
+                        reservedQuantity: {
+                            increment: item.quantity,
+                        },
+                    },
                 });
             }
 
-            // Calculate available quantity
-            const availableQuantity =
-                inventory.physicalQuantity -
-                inventory.reservedQuantity;
-
-            // Check stock
-            if (availableQuantity < item.quantity) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Insufficient inventory for product ${item.productId}`,
-                    availableQuantity,
-                    requiredQuantity: item.quantity,
-                });
-            }
-
-            // Reserve inventory
-            await prisma.inventory.update({
+            // Mark sales order as reserved
+            await tx.salesOrder.update({
                 where: {
-                    productId: item.productId,
+                    id: salesOrderId,
                 },
                 data: {
-                    reservedQuantity: {
-                        increment: item.quantity,
-                    },
+                    inventoryReserved: true,
                 },
             });
-        }
 
-        // Mark sales order as inventory reserved
-        await prisma.salesOrder.update({
-            where: {
-                id: salesOrderId,
-            },
-            data: {
-                inventoryReserved: true,
-            },
-        });
-
-        // Get updated inventory
-        const updatedInventory = await prisma.inventory.findMany({
-            where: {
-                productId: {
-                    in: salesOrder.items.map(
-                        (item) => item.productId
-                    ),
+            // Return updated inventory
+            return await tx.inventory.findMany({
+                where: {
+                    productId: {
+                        in: items.map(
+                            (item) => item.productId
+                        ),
+                    },
                 },
-            },
-            include: {
-                product: true,
-            },
+                include: {
+                    product: true,
+                },
+            });
         });
 
         return res.status(200).json({
@@ -250,10 +275,19 @@ export const reserveInventory = async (req, res) => {
     } catch (error) {
         console.error("Reserve inventory error:", error);
 
-        return res.status(500).json({
+        return res.status(error.statusCode || 500).json({
             success: false,
-            message: "Failed to reserve inventory",
-            error: error.message,
+            message:
+                error.message ||
+                "Failed to reserve inventory",
+            ...(error.availableQuantity !== undefined && {
+                availableQuantity:
+                    Number(error.availableQuantity),
+            }),
+            ...(error.requiredQuantity !== undefined && {
+                requiredQuantity:
+                    Number(error.requiredQuantity),
+            }),
         });
     }
 };

@@ -235,22 +235,26 @@ export const updateSalesOrderStatus = async (req, res) => {
         ) {
             await prisma.$transaction(async (tx) => {
                 // Check inventory for every product
+                // Lock inventory rows before checking stock
                 for (const item of existingOrder.items) {
-                    const inventory = await tx.inventory.findUnique({
-                        where: {
-                            productId: item.productId,
-                        },
-                    });
+                    const inventoryRows = await tx.$queryRaw`
+        SELECT *
+        FROM "Inventory"
+        WHERE "productId" = ${item.productId}
+        FOR UPDATE
+    `;
 
-                    if (!inventory) {
+                    if (inventoryRows.length === 0) {
                         throw new Error(
                             `Inventory not found for product ${item.productId}`
                         );
                     }
 
+                    const inventory = inventoryRows[0];
+
                     const availableQuantity =
-                        inventory.physicalQuantity -
-                        inventory.reservedQuantity;
+                        Number(inventory.physicalQuantity) -
+                        Number(inventory.reservedQuantity);
 
                     if (availableQuantity < item.quantity) {
                         throw new Error(
@@ -280,6 +284,7 @@ export const updateSalesOrderStatus = async (req, res) => {
                     },
                     data: {
                         status: "CONFIRMED",
+                        inventoryReserved: true,
                     },
                 });
             });
@@ -386,10 +391,21 @@ export const updateSalesOrderStatus = async (req, res) => {
     } catch (error) {
         console.error("Update sales order status error:", error);
 
-        return res.status(500).json({
+        const statusCode =
+            error.message?.includes("Insufficient stock") ||
+                error.message?.includes("Insufficient inventory")
+                ? 400
+                : 500;
+
+        return res.status(statusCode).json({
             success: false,
-            message: "Failed to update sales order status",
-            error: error.message,
+            message:
+                statusCode === 400
+                    ? error.message
+                    : "Failed to update sales order status",
+            ...(statusCode === 500 && {
+                error: error.message,
+            }),
         });
     }
 };
